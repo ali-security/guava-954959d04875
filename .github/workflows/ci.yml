@@ -1,12 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -27,6 +27,7 @@ jobs:
             java: 17
             root-pom: pom.xml
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     env:
       ROOT_POM: ${{ matrix.root-pom }}
     steps:
@@ -49,7 +50,54 @@ jobs:
         run: mvn -B -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=warn install -U -DskipTests=true -f $ROOT_POM
       - name: 'Test'
         shell: bash
-        run: mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM -Dtest='${{ inputs.test-filter }}' -DfailIfNoTests=false
+          else
+            mvn -B -P!standard-with-extra-repos verify -U -Dmaven.javadoc.skip=true -f $ROOT_POM
+          fi
+      - name: 'Print skipped tests with reasons'
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then PY=python; else PY=python3; fi
+          cat > "$RUNNER_TEMP/skips.py" <<'PYEOF'
+          import glob, os, re, xml.etree.ElementTree as ET
+          base = os.path.dirname(os.environ["ROOT_POM"]) or "."
+          srcs = {}
+          def source_reason(module, method):
+              if module not in srcs:
+                  files = glob.glob(os.path.join(module, "test", "**", "*.java"), recursive=True)
+                  srcs[module] = [(f, open(f, encoding="utf-8", errors="replace").read().splitlines()) for f in files]
+              pat = re.compile(r"void\s+" + re.escape(method) + r"\s*\(")
+              for f, lines in srcs[module]:
+                  for i, line in enumerate(lines):
+                      if pat.search(line):
+                          for l in lines[i:i + 10]:
+                              if "assume" in l:
+                                  return "JUnit assumption not met: " + l.strip() + " (" + os.path.basename(f) + ")"
+              return "no message recorded"
+          total = 0
+          for x in sorted(glob.glob(os.path.join(base, "*", "target", "surefire-reports", "TEST-*.xml"))):
+              module = os.path.dirname(os.path.dirname(os.path.dirname(x)))
+              for tc in ET.parse(x).getroot().iter("testcase"):
+                  sk = tc.find("skipped")
+                  if sk is None:
+                      continue
+                  total += 1
+                  name = re.sub(r"\[.*$", "", tc.get("name", ""))
+                  reason = sk.get("message") or source_reason(module, name)
+                  print("SKIPPED %s.%s -- reason: %s" % (tc.get("classname"), tc.get("name"), reason))
+          print("Total skipped tests: %d" % total)
+          PYEOF
+          $PY "$RUNNER_TEMP/skips.py"
+      - name: 'Upload guava jar'
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.java == 11 && matrix.root-pom == 'pom.xml' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: guava-jar
+          path: guava/target/guava-*-jre.jar
+          if-no-files-found: error
       - name: 'Print Surefire reports'
         # Note: Normally a step won't run if the job has failed, but this causes it to
         if: ${{ failure() }}
@@ -61,6 +109,7 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: 'Check out repository'
         uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
@@ -87,6 +136,7 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: 'Check out repository'
         uses: actions/checkout@8e5e7e5ab8b370d6c329ec480221332ada57f0ab
